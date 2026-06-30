@@ -1,12 +1,15 @@
 // =====================================================================
-// PlantUML for Confluence - Content Script (POC step 1)
+// PlantUML for Confluence - Content Script (POC step 2)
 // =====================================================================
 // Injected on every https page (see manifest "matches": https://*/*),
-// but only ACTIVE on Confluence pages. We detect Confluence generically
-// from DOM markers so no specific host name has to be hard-coded.
+// but only ACTIVE on Confluence pages (detected via DOM markers, so no
+// host name is hard-coded).
 //
-// For now it ONLY detects PlantUML code blocks (@startuml ... @enduml)
-// inside <code> elements and logs them to the console. No rendering yet.
+// Detects PlantUML code blocks (@startuml ... @enduml) inside <code>
+// elements and renders each one client-side with the TeaVM-compiled
+// PlantUML engine. The rendered diagram is shown in a sandboxed iframe
+// inserted right AFTER the original code block. Minimal: no toolbar,
+// no copy buttons, no edit modal.
 // =====================================================================
 
 (function () {
@@ -17,45 +20,86 @@
   // ===================
 
   // ------------------------------------------------------------------
-  // Generic Confluence detection.
-  //
-  // Confluence (Server / Data Center) exposes several DOM markers that
-  // are independent of the host name:
-  //   - <body id="com-atlassian-confluence"> (or that id on <html>)
-  //   - <meta name="ajs-*"> tags (AJS = Atlassian JavaScript), e.g.
-  //     ajs-page-id, ajs-confluence-flavour, ajs-base-url...
-  //   - a global "confluence" CSS class / data attributes
-  // We treat the page as Confluence if any of these are present.
+  // Generic Confluence detection (no host name hard-coded).
   // ------------------------------------------------------------------
   function isConfluence() {
     if (document.getElementById('com-atlassian-confluence')) return true;
     if (document.querySelector('meta[name^="ajs-confluence"]')) return true;
     if (document.querySelector('meta[name="ajs-page-id"]')) return true;
     if (document.querySelector('meta[name="confluence-request-time"]')) return true;
-    // Body / html marker classes used by Confluence themes.
     const root = document.documentElement;
     if (root && /confluence/i.test(root.className)) return true;
     return false;
   }
 
   if (!isConfluence()) {
-    // Not a Confluence page: stay completely silent and do nothing.
-    return;
+    return; // Not Confluence: stay silent.
   }
 
   TRACE('content script active on', location.href);
 
-  // Marker so we don't re-process / re-log the same <code> block twice
-  // (the MutationObserver can fire many times on a SPA).
+  // URL of the renderer page packaged inside the extension.
+  const RENDERER_URL = chrome.runtime.getURL('renderer.html');
+  const RENDERER_ORIGIN = new URL(RENDERER_URL).origin;
+
+  // Marker so we don't re-process the same <code> block twice.
   const PROCESSED_ATTR = 'data-plantuml-for-confluence-seen';
 
+  let blockCounter = 0;
+
   // ------------------------------------------------------------------
-  // Scan the given root for PlantUML blocks and log them.
-  // Core extraction logic based on the provided snippet.
+  // Resolve the right postMessage targetOrigin for the renderer iframe.
+  // sandbox="allow-scripts" without allow-same-origin gives the iframe
+  // an opaque "null" origin; messages to chrome-extension://... get
+  // dropped unless we target '*'.
   // ------------------------------------------------------------------
-  function scanAndLog(root) {
+  function targetOriginFor(iframe) {
+    const sb = iframe.getAttribute('sandbox') || '';
+    if (sb.includes('allow-scripts') && !sb.includes('allow-same-origin')) {
+      return '*';
+    }
+    return RENDERER_ORIGIN;
+  }
+
+  // ------------------------------------------------------------------
+  // Render one PlantUML block: insert a renderer iframe right after the
+  // <code> element and post the source to it once loaded.
+  // ------------------------------------------------------------------
+  function renderBlock(codeEl, source) {
+    const requestId = `puml-${++blockCounter}-${Date.now()}`;
+
+    const iframe = document.createElement('iframe');
+    iframe.src = RENDERER_URL;
+    iframe.sandbox = 'allow-scripts';
+    iframe.dataset.requestId = requestId;
+    iframe.className = 'plantuml-for-confluence-frame';
+    iframe.style.cssText =
+      'border: none; width: 100%; min-height: 60px; display: block; ' +
+      'margin: 8px 0; background: transparent;';
+    iframe.setAttribute('title', 'PlantUML diagram');
+
+    // Insert right after the code block. Walk up to the enclosing <pre>
+    // if there is one, so the iframe lands after the whole block rather
+    // than inside it.
+    const anchor = codeEl.closest('pre') || codeEl;
+    anchor.parentNode.insertBefore(iframe, anchor.nextSibling);
+
+    iframe.addEventListener('load', () => {
+      iframe.contentWindow.postMessage({
+        type: 'PLANTUML_RENDER',
+        source,
+        requestId,
+        options: { dark: false }
+      }, targetOriginFor(iframe));
+      TRACE('PLANTUML_RENDER posted, requestId=' + requestId);
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Scan the given root for PlantUML blocks and render each one.
+  // ------------------------------------------------------------------
+  function scanAndRender(root) {
     const codeElements = root.querySelectorAll('code');
-    const plantUmlBlocks = [];
 
     codeElements.forEach((element) => {
       if (element.hasAttribute(PROCESSED_ATTR)) return;
@@ -66,36 +110,50 @@
 
       if (match) {
         element.setAttribute(PROCESSED_ATTR, '1');
-        plantUmlBlocks.push(match[0].trim());
+        const source = match[0].trim();
+        TRACE('rendering block, source.len=' + source.length);
+        renderBlock(element, source);
       }
     });
-
-    if (plantUmlBlocks.length === 0) return;
-
-    TRACE(`${plantUmlBlocks.length} bloc PlantUML :`);
-    plantUmlBlocks.forEach((bloc, index) => {
-      TRACE(`--- Bloc ${index + 1} ---`);
-      TRACE(bloc);
-    });
   }
+
+  // ------------------------------------------------------------------
+  // Listen for results coming back from the renderer iframes and set
+  // the iframe height to fit the rendered diagram.
+  // ------------------------------------------------------------------
+  window.addEventListener('message', (event) => {
+    if (event.origin !== RENDERER_ORIGIN && event.origin !== 'null') return;
+    const data = event.data;
+    if (!data || typeof data !== 'object') return;
+    if (data.type !== 'PLANTUML_RESULT' && data.type !== 'PLANTUML_ERROR') return;
+
+    const iframe = document.querySelector(
+      `iframe[data-request-id="${CSS.escape(data.requestId)}"]`
+    );
+    if (!iframe) return;
+
+    if (data.type === 'PLANTUML_RESULT' && typeof data.height === 'number') {
+      iframe.style.height = (data.height + 8) + 'px';
+      TRACE('iframe height set to ' + (data.height + 8) + 'px for ' + data.requestId);
+    }
+    // On PLANTUML_ERROR the renderer already shows the error inline.
+  });
 
   // ------------------------------------------------------------------
   // Initial scan.
   // ------------------------------------------------------------------
   TRACE('starting initial scan');
-  scanAndLog(document.body);
+  scanAndRender(document.body);
   TRACE('initial scan done');
 
   // ------------------------------------------------------------------
-  // Watch for dynamically added content. Confluence is a SPA: it loads
-  // page content after the initial document and navigates without full
-  // reloads, so blocks often appear after document_idle.
+  // Watch for dynamically added content (Confluence is a SPA).
   // ------------------------------------------------------------------
   const observer = new MutationObserver((mutations) => {
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (node.nodeType === Node.ELEMENT_NODE) {
-          scanAndLog(node);
+          scanAndRender(node);
         }
       }
     }
